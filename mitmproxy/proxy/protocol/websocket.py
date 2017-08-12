@@ -3,9 +3,12 @@ import socket
 import struct
 from OpenSSL import SSL
 
+from wsproto.connection import ConnectionType, WSConnection
+
 from mitmproxy import exceptions
 from mitmproxy import flow
 from mitmproxy.proxy.protocol import base
+from mitmproxy.net import http
 from mitmproxy.net import tcp
 from mitmproxy.net import websockets
 from mitmproxy.websocket import WebSocketFlow, WebSocketMessage
@@ -44,15 +47,34 @@ class WebSocketLayer(base.Layer):
         self.client_frame_buffer = []
         self.server_frame_buffer = []
 
-    def _handle_frame(self, frame, source_conn, other_conn, is_server):
-        if frame.header.opcode & 0x8 == 0:
-            return self._handle_data_frame(frame, source_conn, other_conn, is_server)
-        elif frame.header.opcode in (websockets.OPCODE.PING, websockets.OPCODE.PONG):
-            return self._handle_ping_pong(frame, source_conn, other_conn, is_server)
-        elif frame.header.opcode == websockets.OPCODE.CLOSE:
-            return self._handle_close(frame, source_conn, other_conn, is_server)
-        else:
-            return self._handle_unknown_frame(frame, source_conn, other_conn, is_server)
+        self.connections = {}  # type: Dict[object, WSConnection]
+
+        self.connections[self.client_conn] = WSConnection(ConnectionType.CLIENT,
+                                                          host=handshake_flow.request.host,
+                                                          resource=handshake_flow.request.path)
+        data = http.http1.assemble.assemble_request(handshake_flow.request)
+        self.connections[self.client_conn].receive_bytes(data)
+        self.connections[self.client_conn].bytes_to_send()  # clear output buffer
+
+        self.connections[self.server_conn] = WSConnection(ConnectionType.SERVER)
+        data = http.http1.assemble.assemble_response(handshake_flow.response)
+        self.connections[self.server_conn].receive_bytes(data)
+        self.connections[self.server_conn].bytes_to_send()  # clear output buffer
+
+    def _handle_event(self, event, source_conn, other_conn, is_server):
+        if isinstance(event, wsproto.events.DataReceived):
+            return self._handle_data_received()
+        elif isinstance(event, wsproto.events.PingReceived):
+            return self._handle_ping_received()
+        elif isinstance(event, wsproto.events.PongReceived):
+            return self._handle_pong_received()
+        elif isinstance(event, wsproto.events.ConnectionFailed):
+            return self._handle_connection_closed()
+        elif isinstance(event, wsproto.events.ConnectionFailed):
+            return self._handle_connection_failed()
+
+        # fail-safe for unhandled events
+        return True
 
     def _handle_data_frame(self, frame, source_conn, other_conn, is_server):
 
@@ -138,42 +160,31 @@ class WebSocketLayer(base.Layer):
         # initiate close handshake
         return False
 
-    def _handle_unknown_frame(self, frame, source_conn, other_conn, is_server):
-        # unknown frame - just forward it
-        other_conn.send(bytes(frame))
-
-        sender = "server" if is_server else "client"
-        self.log("Unknown WebSocket frame received from {}".format(sender), "info", [repr(frame)])
-
-        return True
-
     def __call__(self):
         self.flow = WebSocketFlow(self.client_conn, self.server_conn, self.handshake_flow, self)
         self.flow.metadata['websocket_handshake'] = self.handshake_flow.id
         self.handshake_flow.metadata['websocket_flow'] = self.flow.id
         self.channel.ask("websocket_start", self.flow)
 
-        client = self.client_conn.connection
-        server = self.server_conn.connection
-        conns = [client, server]
+        conns = [c.connection for c in self.connections.keys()]
         close_received = False
 
         try:
             while not self.channel.should_exit.is_set():
                 r = tcp.ssl_read_select(conns, 0.1)
                 for conn in r:
-                    source_conn = self.client_conn if conn == client else self.server_conn
-                    other_conn = self.server_conn if conn == client else self.client_conn
-                    is_server = (conn == self.server_conn.connection)
+                    source_conn = self.client_conn if conn == self.client_conn.connection else self.server_conn
+                    other_conn = self.server_conn if conn == self.client_conn.connection else self.client_conn
+                    is_server = (source_conn == self.server_conn)
 
                     frame = websockets.Frame.from_file(source_conn.rfile)
 
-                    cont = self._handle_frame(frame, source_conn, other_conn, is_server)
-                    if not cont:
-                        if close_received:
-                            return
-                        else:
-                            close_received = True
+                    for event in incoming_events:
+                        if not self._handle_event(event, source_conn, other_conn, is_server):
+                            if close_received:
+                                return
+                            else:
+                                close_received = True
         except (socket.error, exceptions.TcpException, SSL.Error) as e:
             s = 'server' if is_server else 'client'
             self.flow.error = flow.Error("WebSocket connection closed unexpectedly by {}: {}".format(s, repr(e)))
